@@ -167,7 +167,10 @@ class LeRobotDataset(Dataset):
         binarize_gripper: bool = False,
         cache_dir: Optional[Union[str, Path]] = None,
         use_augmentation: bool = False,
+        augmentation_mode: str = 'legacy_mix',
+        augmentation_prob: float = 0.5,
         num_cache_workers: Optional[int] = None,
+        episode_cache_mode: str = 'pkl',
     ):
         self.config = config
         sorted_datasets = sorted(self.config['data_groups'].keys())
@@ -179,6 +182,11 @@ class LeRobotDataset(Dataset):
         self.max_samples_per_file = max_samples_per_file
         self.binarize_gripper = binarize_gripper
         self.use_augmentation = use_augmentation
+        self.augmentation_mode = str(augmentation_mode).lower()
+        self.augmentation_prob = float(augmentation_prob)
+        if self.augmentation_mode not in {'legacy_mix', 'always', 'off'}:
+            raise ValueError(f'Unknown augmentation_mode: {augmentation_mode}')
+        self.augmentation_prob = min(max(self.augmentation_prob, 0.0), 1.0)
         self.cache_root = dataset_cache_root(cache_dir)
         self.cache_root.mkdir(parents=True, exist_ok=True)
         self.data: List[str] = []
@@ -187,6 +195,7 @@ class LeRobotDataset(Dataset):
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs or {}
         self.num_cache_workers = num_cache_workers
+        self.episode_cache_mode = episode_cache_mode
 
         self._load_metadata()
         self._load_trajectories()
@@ -201,6 +210,15 @@ class LeRobotDataset(Dataset):
             T.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5, hue=0.08),
             T.ToTensor(),
         ])
+
+    def _choose_image_transform(self):
+        if (not self.use_augmentation) or self.augmentation_mode == 'off':
+            return self.basic_transform
+        if self.augmentation_mode == 'always':
+            return self.aug_transform
+        if torch.rand((), dtype=torch.float32).item() < self.augmentation_prob:
+            return self.aug_transform
+        return self.basic_transform
 
     def _stats_cache_path(self, dataset_path: Path) -> Path:
         cache_key = _build_cache_key(dataset_path, self.action_horizon, self.max_samples_per_file)
@@ -246,7 +264,17 @@ class LeRobotDataset(Dataset):
             self.arm2stats_dict[arm_name] = merge_lerobot_stats(norm_arm_list)
 
     def _load_trajectories(self):
+        if self.episode_cache_mode == 'index':
+            self._load_trajectories_index()
+            return
+        if self.episode_cache_mode == 'pkl':
+            self._load_trajectories_pkl()
+            return
+        raise ValueError(f'Unknown episode_cache_mode: {self.episode_cache_mode}')
+
+    def _load_trajectories_pkl(self):
         parquet_process_units = []
+        worker_errors: List[str] = []
         for arm_name, arm_config in self.config['data_groups'].items():
             for dataset_name, dataset_config in arm_config.items():
                 dataset_path = Path(dataset_config.get('path')).expanduser().resolve()
@@ -279,6 +307,8 @@ class LeRobotDataset(Dataset):
                 for episode_files, error in pool.imap_unordered(_process_parquet_file_worker, parquet_process_units):
                     if error:
                         logger.error(error)
+                        if len(worker_errors) < 5:
+                            worker_errors.append(error)
                     else:
                         self.data.extend(episode_files)
                         total_episodes += len(episode_files)
@@ -286,8 +316,74 @@ class LeRobotDataset(Dataset):
                     progress.update(1)
 
         if not self.data:
-            raise ValueError('Dataset cache build produced zero episodes')
+            error_suffix = ''
+            if worker_errors:
+                error_suffix = ' First worker errors: ' + ' | '.join(worker_errors)
+            raise ValueError('Dataset cache build produced zero episodes.' + error_suffix)
         logger.info('Prepared %s cached episodes under %s', len(self.data), self.cache_root)
+
+    def _build_index_episode(
+        self,
+        sub_df: pd.DataFrame,
+        arm_name: str,
+        dataset_name: str,
+        task_mapping: Dict[int, str],
+        video_paths: Dict[str, str],
+    ) -> Dict[str, Any]:
+        task_index = sub_df.iloc[0].get('task_index')
+        prompt = task_mapping.get(task_index, '') if task_index is not None else ''
+        return {
+            'arm_key': arm_name,
+            'dataset_key': dataset_name,
+            'prompt': prompt,
+            'state': sub_df.iloc[0].get('observation.state'),
+            'action': [row['action'] for _, row in sub_df.iterrows()],
+            'video_paths': video_paths,
+            'timestamp': sub_df.iloc[0].get('timestamp'),
+        }
+
+    def _load_trajectories_index(self):
+        total_episodes = 0
+        for arm_name, arm_config in self.config['data_groups'].items():
+            for dataset_name, dataset_config in arm_config.items():
+                dataset_path = Path(dataset_config.get('path')).expanduser().resolve()
+                if not dataset_path.exists():
+                    raise FileNotFoundError(f'Dataset path not found: {dataset_path}')
+                parquet_files = sorted(dataset_path.glob('data/*/*.parquet'))
+                if not parquet_files:
+                    continue
+                task_mapping = self.tasks[arm_name][dataset_name]
+                view_map = dataset_config.get('view_map') or _default_view_map()
+                for parquet_path in tqdm(parquet_files, desc=f'Indexing trajectories for {dataset_name}'):
+                    df = pd.read_parquet(parquet_path)
+                    last_row = df.iloc[-1:]
+                    padding_rows = pd.concat([last_row] * self.action_horizon, ignore_index=True)
+                    df = pd.concat([df, padding_rows], ignore_index=True)
+                    if self.max_samples_per_file is not None:
+                        df = df.head(self.max_samples_per_file)
+
+                    base_video_path = dataset_path / 'videos' / parquet_path.parent.name
+                    video_paths = {}
+                    for view_key, view_folder in view_map.items():
+                        full_path = base_video_path / view_folder / f'{parquet_path.stem}.mp4'
+                        if full_path.exists():
+                            video_paths[view_key] = str(full_path)
+
+                    for index in range(len(df) - self.action_horizon + 1):
+                        sub_df = df.iloc[index:index + self.action_horizon]
+                        episode = self._build_index_episode(
+                            sub_df=sub_df,
+                            arm_name=arm_name,
+                            dataset_name=dataset_name,
+                            task_mapping=task_mapping,
+                            video_paths=video_paths,
+                        )
+                        self.data.append(episode)
+                        total_episodes += 1
+
+        if not self.data:
+            raise ValueError('Dataset index build produced zero episodes.')
+        logger.info('Prepared %s indexed episodes in memory', total_episodes)
 
     def _load_video_frame(self, video_paths: Dict[str, str], timestamp: float) -> List[Image.Image]:
         if not video_paths:
@@ -334,7 +430,11 @@ class LeRobotDataset(Dataset):
         return len(self.data)
 
     def _load_cached_episode(self, idx: int) -> Dict[str, Any]:
-        cache_filepath = Path(self.data[idx])
+        episode_ref = self.data[idx]
+        if isinstance(episode_ref, dict):
+            return episode_ref
+
+        cache_filepath = Path(episode_ref)
         try:
             with open(cache_filepath, 'rb') as handle:
                 item = pickle.load(handle)
@@ -347,7 +447,7 @@ class LeRobotDataset(Dataset):
 
     def _load_raw_item(self, idx: int) -> Dict[str, Any]:
         item = self._load_cached_episode(idx)
-        cache_filepath = Path(item['_cache_filepath'])
+        cache_filepath = Path(item.get('_cache_filepath', f'<memory:{idx}>'))
 
         arm_key = item.get('arm_key')
         dataset_key = item.get('dataset_key')
@@ -380,7 +480,8 @@ class LeRobotDataset(Dataset):
         cache_filepath = raw_item.get('cache_filepath', '<unknown>')
         embodiment_id = self.arm_to_embodiment_id[arm_key]
         frames = raw_item['frames']
-        images = [self.aug_transform(img) if self.use_augmentation else self.basic_transform(img) for img in frames]
+        transform = self._choose_image_transform()
+        images = [transform(img) for img in frames]
 
         if len(images) > self.max_views:
             raise ValueError(f'Number of views {len(images)} exceeds max_views {self.max_views}')

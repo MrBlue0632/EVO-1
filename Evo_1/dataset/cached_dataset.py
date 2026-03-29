@@ -23,6 +23,8 @@ class CachedLeRobotDataset(Dataset):
         manifest_path: Union[str, Path],
         image_size: int = 448,
         use_augmentation: bool = False,
+        augmentation_mode: str = "legacy_mix",
+        augmentation_prob: float = 0.5,
     ) -> None:
         self.manifest_path = Path(manifest_path).expanduser().resolve()
         with open(self.manifest_path, 'r', encoding='utf-8') as handle:
@@ -39,6 +41,10 @@ class CachedLeRobotDataset(Dataset):
         self.max_views = manifest['max_views']
         self.image_size = image_size
         self.use_augmentation = use_augmentation
+        self.augmentation_mode = str(augmentation_mode).lower()
+        self.augmentation_prob = min(max(float(augmentation_prob), 0.0), 1.0)
+        if self.augmentation_mode not in {"legacy_mix", "always", "off"}:
+            raise ValueError(f"Unknown augmentation_mode: {augmentation_mode}")
 
         self.basic_transform = T.Compose([
             T.Resize((self.image_size, self.image_size), interpolation=InterpolationMode.BICUBIC),
@@ -50,6 +56,15 @@ class CachedLeRobotDataset(Dataset):
             T.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5, hue=0.08),
             T.ToTensor(),
         ])
+
+    def _choose_image_transform(self):
+        if (not self.use_augmentation) or self.augmentation_mode == "off":
+            return self.basic_transform
+        if self.augmentation_mode == "always":
+            return self.aug_transform
+        if torch.rand((), dtype=torch.float32).item() < self.augmentation_prob:
+            return self.aug_transform
+        return self.basic_transform
 
     def _validate_manifest(self, manifest: Dict[str, Any]) -> None:
         schema_version = int(manifest.get('schema_version', 0))
@@ -80,7 +95,7 @@ class CachedLeRobotDataset(Dataset):
         return len(self.samples)
 
     def _load_images(self, image_paths: List[str]) -> torch.Tensor:
-        transform = self.aug_transform if self.use_augmentation else self.basic_transform
+        transform = self._choose_image_transform()
         images = []
         for image_path in image_paths:
             path = self.root / image_path

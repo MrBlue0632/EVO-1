@@ -30,6 +30,7 @@ class EVO1(nn.Module):
             device=self._device,
             enable_gradient_checkpointing=self.model_config.finetune_vlm,
             enable_tensor_fastpath=self.model_config.embedder_tensor_fastpath,
+            gradient_checkpointing_use_reentrant=self.model_config.gradient_checkpointing_use_reentrant,
         )
         self.action_head = self._build_action_head().to(self._device)
 

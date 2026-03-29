@@ -83,6 +83,7 @@ class InternVL3Embedder(nn.Module):
         device="cuda",
         enable_gradient_checkpointing: bool = False,
         enable_tensor_fastpath: bool = True,
+        gradient_checkpointing_use_reentrant: bool = False,
     ):
         super().__init__()
         self.device = device
@@ -90,6 +91,7 @@ class InternVL3Embedder(nn.Module):
         self.max_text_length = 1024  # InternVL3 supports up to 1024 tokens
         self.enable_gradient_checkpointing = bool(enable_gradient_checkpointing)
         self.enable_tensor_fastpath = bool(enable_tensor_fastpath)
+        self.gradient_checkpointing_use_reentrant = bool(gradient_checkpointing_use_reentrant)
         self.transform = build_transform(image_size)
         self._mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1)
         self._std = torch.tensor(IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
@@ -122,6 +124,17 @@ class InternVL3Embedder(nn.Module):
         self._configure_memory_features()
 
     def _configure_memory_features(self) -> None:
+        checkpoint_kwargs = {"use_reentrant": self.gradient_checkpointing_use_reentrant}
+
+        def _enable_ckpt(module) -> bool:
+            if module is None or not hasattr(module, "gradient_checkpointing_enable"):
+                return False
+            try:
+                module.gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpoint_kwargs)
+            except TypeError:
+                module.gradient_checkpointing_enable()
+            return True
+
         if not self.enable_gradient_checkpointing:
             if hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "encoder"):
                 self.model.vision_model.encoder.gradient_checkpointing = False
@@ -129,9 +142,7 @@ class InternVL3Embedder(nn.Module):
 
         enabled_any = False
 
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-            enabled_any = True
+        enabled_any = _enable_ckpt(self.model) or enabled_any
 
         if hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "encoder"):
             self.model.vision_model.encoder.gradient_checkpointing = True
@@ -139,12 +150,9 @@ class InternVL3Embedder(nn.Module):
 
         if hasattr(self.model, "language_model"):
             language_model = self.model.language_model
-            if hasattr(language_model, "gradient_checkpointing_enable"):
-                language_model.gradient_checkpointing_enable()
-                enabled_any = True
-            if hasattr(language_model, "model") and hasattr(language_model.model, "gradient_checkpointing_enable"):
-                language_model.model.gradient_checkpointing_enable()
-                enabled_any = True
+            enabled_any = _enable_ckpt(language_model) or enabled_any
+            if hasattr(language_model, "model"):
+                enabled_any = _enable_ckpt(language_model.model) or enabled_any
             if hasattr(language_model, "config"):
                 language_model.config.use_cache = False
 

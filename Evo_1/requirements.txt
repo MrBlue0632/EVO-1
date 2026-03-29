@@ -3,13 +3,12 @@ timm
 torch==2.5.1
 torchvision==0.20.1
 accelerate
-einop
+einops
 diffusers
 ninja
 pandas
 matplotlib
 pyarrow
-accelerator
 deepspeed
 websockets
 opencv-python

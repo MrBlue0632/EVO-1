@@ -1,0 +1,12 @@
+max_action_dim: 24
+max_state_dim: 24
+max_views: 3
+
+data_groups:
+  aloha_agilex:
+    click_alarmclock_25_10_08_v2_1:
+      path: /root/click_alarmclock_25_10_08_v2.1
+      view_map:
+        image_1: observation.images.image_1
+        image_2: observation.images.image_2
+        image_3: observation.images.image_3

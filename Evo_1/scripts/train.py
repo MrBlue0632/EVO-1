@@ -1,14 +1,17 @@
 import argparse
+import inspect
 import json
 import logging
 import math
 import os
+import random
 import shutil
 import sys
 import time
 import warnings
 from datetime import datetime
 
+import numpy as np
 import torch
 import torch.nn as nn
 from accelerate import Accelerator, DistributedType
@@ -37,6 +40,59 @@ def get_with_warning(config: dict, key: str, default):
         return config[key]
     warnings.warn("%s not found in config, using default: %r" % (key, default))
     return default
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def is_distributed_initialized() -> bool:
+    return (
+        accelerator.distributed_type != DistributedType.NO
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    )
+
+
+def distributed_mean_scalar(value: torch.Tensor) -> torch.Tensor:
+    mean_value = value.detach().float()
+    if is_distributed_initialized():
+        torch.distributed.all_reduce(mean_value, op=torch.distributed.ReduceOp.SUM)
+        mean_value /= accelerator.num_processes
+    return mean_value
+
+
+def summarize_tensor(tensor: torch.Tensor) -> dict:
+    detached = tensor.detach()
+    return {
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+        "is_finite": bool(torch.isfinite(detached).all().item()),
+        "min": float(detached.min().item()) if detached.numel() > 0 else 0.0,
+        "max": float(detached.max().item()) if detached.numel() > 0 else 0.0,
+        "mean": float(detached.float().mean().item()) if detached.numel() > 0 else 0.0,
+    }
+
+
+def dump_numerical_issue(save_dir: str, step: int, **named_tensors) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+    payload = {
+        "step": int(step),
+        "captured_at": datetime.now().isoformat(),
+        "tensors": {},
+    }
+    for name, tensor in named_tensors.items():
+        if isinstance(tensor, torch.Tensor):
+            payload["tensors"][name] = summarize_tensor(tensor)
+    out_path = os.path.join(save_dir, f"numerical_issue_step_{step}.json")
+    with open(out_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return out_path
 
 
 def inspect_named_submodules(module_dict: dict, verbose: bool = True):
@@ -147,7 +203,7 @@ def init_swanlab(config: dict):
 
             swanlab = swanlab_module
             swanlab.init(
-                project=config.get("wandb_project", "default_run"),
+                project=config.get("swanlab_project", config.get("wandb_project", "default_run")),
                 name=config.get("run_name", "default_run"),
                 config=config,
             )
@@ -168,9 +224,27 @@ def check_numerical_stability(step: int, **named_tensors) -> bool:
     return True
 
 
-def log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloader):
+def log_training_step(
+    step,
+    loss,
+    total_norm,
+    clipped_norm,
+    scheduler,
+    dataloader,
+    sec_per_step=None,
+    samples_per_sec=None,
+    window_max_allocated_gb=None,
+    window_max_reserved_gb=None,
+    global_max_allocated_gb=None,
+    global_max_reserved_gb=None,
+    current_allocated_gb=None,
+    current_reserved_gb=None,
+):
     current_epoch = step / len(dataloader)
     if accelerator.is_main_process:
+        it_per_sec = None
+        if sec_per_step is not None:
+            it_per_sec = 1.0 / max(sec_per_step, 1e-8)
         logging.info("Estimated Epoch: %.2f", current_epoch)
         logging.info(
             "[Step %s] Loss: %.4f | grad_norm: %.4f -> %.4f",
@@ -179,12 +253,50 @@ def log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloade
             total_norm.item(),
             clipped_norm.item(),
         )
+        if sec_per_step is not None and samples_per_sec is not None and it_per_sec is not None:
+            logging.info("Speed: %.4f s/it | %.2f it/s | %.2f samples/s", sec_per_step, it_per_sec, samples_per_sec)
+        if window_max_allocated_gb is not None or window_max_reserved_gb is not None:
+            logging.info(
+                "Memory window peak: allocated=%.2f GiB reserved=%.2f GiB",
+                window_max_allocated_gb or 0.0,
+                window_max_reserved_gb or 0.0,
+            )
+        if global_max_allocated_gb is not None or global_max_reserved_gb is not None:
+            logging.info(
+                "Memory global peak: allocated=%.2f GiB reserved=%.2f GiB",
+                global_max_allocated_gb or 0.0,
+                global_max_reserved_gb or 0.0,
+            )
+        if current_allocated_gb is not None or current_reserved_gb is not None:
+            logging.info(
+                "Memory current: allocated=%.2f GiB reserved=%.2f GiB",
+                current_allocated_gb or 0.0,
+                current_reserved_gb or 0.0,
+            )
         payload = {
             "step": step,
             "loss": loss.item(),
             "current_epoch": current_epoch,
             "learning_rate": scheduler.get_last_lr()[0],
         }
+        if sec_per_step is not None:
+            payload["sec_per_step"] = sec_per_step
+        if it_per_sec is not None:
+            payload["it_per_sec"] = it_per_sec
+        if samples_per_sec is not None:
+            payload["samples_per_sec"] = samples_per_sec
+        if window_max_allocated_gb is not None:
+            payload["window_max_allocated_gb"] = window_max_allocated_gb
+        if window_max_reserved_gb is not None:
+            payload["window_max_reserved_gb"] = window_max_reserved_gb
+        if global_max_allocated_gb is not None:
+            payload["global_max_allocated_gb"] = global_max_allocated_gb
+        if global_max_reserved_gb is not None:
+            payload["global_max_reserved_gb"] = global_max_reserved_gb
+        if current_allocated_gb is not None:
+            payload["current_allocated_gb"] = current_allocated_gb
+        if current_reserved_gb is not None:
+            payload["current_reserved_gb"] = current_reserved_gb
         if WANDB_ENABLED:
             wandb.log(payload)
         if SWANLAB_ENABLED:
@@ -354,8 +466,8 @@ def build_param_groups(model, wd):
 
 
 def train(config):
-    allow_tf32 = bool(get_with_warning(config, "allow_tf32", True))
-    cudnn_benchmark = bool(get_with_warning(config, "cudnn_benchmark", True))
+    allow_tf32 = bool(get_with_warning(config, "allow_tf32", False))
+    cudnn_benchmark = bool(get_with_warning(config, "cudnn_benchmark", False))
     torch.backends.cuda.matmul.allow_tf32 = allow_tf32
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.allow_tf32 = allow_tf32
@@ -364,6 +476,9 @@ def train(config):
 
     merge_normalized_model_config(config, config)
     save_dir = get_with_warning(config, "save_dir", "checkpoints")
+    seed = int(get_with_warning(config, "seed", 42))
+    rank_seed = seed + accelerator.process_index
+    set_global_seed(rank_seed)
     setup_logging(save_dir)
     init_wandb(config)
     init_swanlab(config)
@@ -376,6 +491,11 @@ def train(config):
     model = build_model(config)
     model.train()
     model.set_finetune_flags()
+    if accelerator.is_main_process and (not bool(config.get("finetune_vlm", False))):
+        logging.info(
+            "VLM is frozen in this run (finetune_vlm=false). "
+            "Stage1 memory footprint is expected to be much lower than full-parameter fine-tuning."
+        )
 
     if accelerator.is_main_process:
         inspect_named_submodules({
@@ -386,9 +506,22 @@ def train(config):
 
     lr = get_with_warning(config, "lr", 1e-5)
     wd = get_with_warning(config, "weight_decay", 1e-5)
-    optimizer = AdamW(build_param_groups(model, wd), lr=lr)
+    use_fused_adamw = bool(get_with_warning(config, "fused_adamw", False))
+    optimizer_kwargs = {}
+    if use_fused_adamw and torch.cuda.is_available():
+        try:
+            if "fused" in inspect.signature(AdamW).parameters:
+                optimizer_kwargs["fused"] = True
+            else:
+                use_fused_adamw = False
+        except (TypeError, ValueError):
+            use_fused_adamw = False
+    else:
+        use_fused_adamw = False
+
+    optimizer = AdamW(build_param_groups(model, wd), lr=lr, **optimizer_kwargs)
     if accelerator.is_main_process:
-        logging.info("Optimizer=AdamW, lr=%s, weight_decay=%s", lr, wd)
+        logging.info("Optimizer=AdamW, lr=%s, weight_decay=%s, fused=%s", lr, wd, use_fused_adamw)
 
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     model_engine = model
@@ -405,16 +538,23 @@ def train(config):
     resume = get_with_warning(config, "resume", False)
     resume_path = get_with_warning(config, "resume_path", None)
     resume_pretrain = get_with_warning(config, "resume_pretrain", False)
-    vlm_batched_forward = bool(get_with_warning(config, "vlm_batched_forward", True))
+    vlm_batched_forward = bool(get_with_warning(config, "vlm_batched_forward", False))
     disable_tqdm = bool(get_with_warning(config, "disable_tqdm", False))
+    grad_accum_steps = max(1, int(get_with_warning(config, "gradient_accumulation_steps", 1)))
+    non_finite_max_streak = max(1, int(get_with_warning(config, "non_finite_max_streak", 5)))
 
     if accelerator.is_main_process:
         logging.info(
-            "Runtime settings: allow_tf32=%s cudnn_benchmark=%s vlm_batched_forward=%s disable_tqdm=%s",
+            "Runtime settings: seed=%s rank_seed=%s allow_tf32=%s cudnn_benchmark=%s "
+            "vlm_batched_forward=%s disable_tqdm=%s grad_accum_steps=%s non_finite_max_streak=%s",
+            seed,
+            rank_seed,
             allow_tf32,
             cudnn_benchmark,
             vlm_batched_forward,
             disable_tqdm,
+            grad_accum_steps,
+            non_finite_max_streak,
         )
 
     if resume != bool(resume_path):
@@ -456,6 +596,15 @@ def train(config):
     last_loss = torch.tensor(0.0, device=accelerator.device)
     last_log_time = time.perf_counter()
     last_log_step = step
+    non_finite_streak = 0
+    accum_counter = 0
+    optimizer.zero_grad(set_to_none=True)
+    global_peak_allocated_gb = None
+    global_peak_reserved_gb = None
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device=accelerator.device)
+        global_peak_allocated_gb = 0.0
+        global_peak_reserved_gb = 0.0
 
     while step < max_steps:
         for batch in tqdm(dataloader, desc="Training", disable=(not accelerator.is_main_process) or disable_tqdm):
@@ -497,46 +646,118 @@ def train(config):
             if action_mask.sum() == 0:
                 raise ValueError("[Step %s] action_mask.sum() is 0" % step)
 
-            action_mask_flat = action_mask.view(action_mask.shape[0], -1).to(dtype=pred_velocity.dtype)
+            action_mask_flat = action_mask.view(action_mask.shape[0], -1).to(dtype=torch.float32)
             pred_velocity_mask = pred_velocity * action_mask_flat
-            loss = loss_fn(pred_velocity_mask, target_velocity)
+            loss = loss_fn(pred_velocity_mask.float(), target_velocity.float())
             scale_factor = action_mask_flat.numel() / (action_mask_flat.sum() + 1e-8)
             loss = loss * scale_factor
 
-            if not check_numerical_stability(
+            local_is_stable = check_numerical_stability(
                 step,
                 states=states,
                 actions_gt=actions_gt,
                 fused_tokens=fused_tokens,
                 pred_velocity=pred_velocity,
                 loss=loss,
-            ):
+            )
+            unstable_flag = torch.tensor(0 if local_is_stable else 1, device=accelerator.device, dtype=torch.int32)
+            if is_distributed_initialized():
+                torch.distributed.all_reduce(unstable_flag, op=torch.distributed.ReduceOp.MAX)
+
+            if int(unstable_flag.item()) == 1:
+                non_finite_streak += 1
+                optimizer.zero_grad(set_to_none=True)
+                accum_counter = 0
+                if accelerator.is_main_process:
+                    diagnostic_path = dump_numerical_issue(
+                        save_dir,
+                        step,
+                        states=states,
+                        actions_gt=actions_gt,
+                        fused_tokens=fused_tokens,
+                        pred_velocity=pred_velocity,
+                        loss=loss,
+                    )
+                    logging.warning(
+                        "[Step %s] Non-finite detected (%s/%s). Diagnostic dumped to %s",
+                        step,
+                        non_finite_streak,
+                        non_finite_max_streak,
+                        diagnostic_path,
+                    )
+                if non_finite_streak >= non_finite_max_streak:
+                    raise RuntimeError(
+                        f"Aborting due to repeated non-finite tensors: "
+                        f"{non_finite_streak} consecutive steps."
+                    )
                 continue
 
-            optimizer.zero_grad(set_to_none=True)
-            accelerator.backward(loss)
-            total_norm, clipped_norm = get_and_clip_grad_norm(model, loss, max_norm)
+            non_finite_streak = 0
+            loss_for_backward = loss / grad_accum_steps
+            accelerator.backward(loss_for_backward)
+            accum_counter += 1
+            if accum_counter < grad_accum_steps:
+                continue
+
+            total_norm, clipped_norm = get_and_clip_grad_norm(model, loss_for_backward, max_norm)
             optimizer.step()
             scheduler.step()
-            last_loss = loss.detach()
+            optimizer.zero_grad(set_to_none=True)
+            accum_counter = 0
+            loss_for_metrics = distributed_mean_scalar(loss)
+            last_loss = loss_for_metrics
+            step += 1
 
-            if step % log_interval == 0:
+            if step % log_interval == 0 or step == 1:
                 now = time.perf_counter()
                 elapsed = now - last_log_time
                 window = max(1, step - last_log_step)
                 sec_per_step = elapsed / window
-                samples_per_sec = float(actions_gt.shape[0]) / max(sec_per_step, 1e-8)
-                if accelerator.is_main_process:
-                    logging.info(
-                        "Speed: %.4f sec/step | %.2f samples/s",
-                        sec_per_step,
-                        samples_per_sec,
-                    )
+                effective_samples = float(actions_gt.shape[0] * grad_accum_steps * accelerator.num_processes)
+                samples_per_sec = effective_samples / max(sec_per_step, 1e-8)
+                window_max_allocated_gb = None
+                window_max_reserved_gb = None
+                current_allocated_gb = None
+                current_reserved_gb = None
+                if torch.cuda.is_available():
+                    max_allocated = torch.cuda.max_memory_allocated(device=accelerator.device)
+                    max_reserved = torch.cuda.max_memory_reserved(device=accelerator.device)
+                    cur_allocated = torch.cuda.memory_allocated(device=accelerator.device)
+                    cur_reserved = torch.cuda.memory_reserved(device=accelerator.device)
+                    window_max_allocated_gb = max_allocated / (1024 ** 3)
+                    window_max_reserved_gb = max_reserved / (1024 ** 3)
+                    current_allocated_gb = cur_allocated / (1024 ** 3)
+                    current_reserved_gb = cur_reserved / (1024 ** 3)
+                    if global_peak_allocated_gb is None:
+                        global_peak_allocated_gb = window_max_allocated_gb
+                    else:
+                        global_peak_allocated_gb = max(global_peak_allocated_gb, window_max_allocated_gb)
+                    if global_peak_reserved_gb is None:
+                        global_peak_reserved_gb = window_max_reserved_gb
+                    else:
+                        global_peak_reserved_gb = max(global_peak_reserved_gb, window_max_reserved_gb)
                 last_log_time = now
                 last_log_step = step
-                log_training_step(step, loss, total_norm, clipped_norm, scheduler, dataloader)
+                log_training_step(
+                    step,
+                    loss_for_metrics,
+                    total_norm,
+                    clipped_norm,
+                    scheduler,
+                    dataloader,
+                    sec_per_step=sec_per_step,
+                    samples_per_sec=samples_per_sec,
+                    window_max_allocated_gb=window_max_allocated_gb,
+                    window_max_reserved_gb=window_max_reserved_gb,
+                    global_max_allocated_gb=global_peak_allocated_gb,
+                    global_max_reserved_gb=global_peak_reserved_gb,
+                    current_allocated_gb=current_allocated_gb,
+                    current_reserved_gb=current_reserved_gb,
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats(device=accelerator.device)
 
-            loss_value = loss.item()
+            loss_value = float(loss_for_metrics.item())
             if accelerator.is_main_process:
                 is_best = loss_value < best_loss
                 if is_best:
@@ -545,7 +766,7 @@ def train(config):
             else:
                 is_best_tensor = torch.tensor(0, device=accelerator.device)
 
-            if accelerator.distributed_type != DistributedType.NO:
+            if is_distributed_initialized():
                 torch.distributed.broadcast(is_best_tensor, src=0)
 
             if is_best_tensor.item() == 1 and step > 1000:
@@ -553,7 +774,7 @@ def train(config):
                     save_dir,
                     step="best",
                     model_engine=model_engine,
-                    loss=loss,
+                    loss=loss_for_metrics,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     config=config,
@@ -561,14 +782,12 @@ def train(config):
                 )
                 if accelerator.is_main_process:
                     logging.info("Saved best checkpoint at step %s with loss %.6f", step, loss_value)
-
-            step += 1
             if step % ckpt_interval == 0 and step > 0:
                 save_checkpoint(
                     save_dir,
                     step=step,
                     model_engine=model_engine,
-                    loss=loss,
+                    loss=loss_for_metrics,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     config=config,
@@ -587,24 +806,51 @@ def train(config):
     )
     logging.info("Final model saved to step_final/")
     logging.info("Best checkpoint saved to step_best/ with loss %.6f", best_loss)
+    if accelerator.is_main_process and global_peak_allocated_gb is not None:
+        logging.info(
+            "Training global memory peak summary: allocated=%.2f GiB reserved=%.2f GiB",
+            global_peak_allocated_gb,
+            global_peak_reserved_gb if global_peak_reserved_gb is not None else 0.0,
+        )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Evo-1")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--run_name", type=str, default="default_run")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--vlm_name", type=str, default="OpenGVLab/InternVL3-1B")
     parser.add_argument("--action_head", type=str, default="flowmatching", choices=["flowmatching"])
     parser.add_argument("--return_cls_only", action="store_true")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable wandb logging.")
     parser.add_argument("--disable_swanlab", action="store_true", help="Disable swanlab logging.")
+    parser.add_argument("--swanlab_project", type=str, default=None)
     parser.add_argument("--dataset_type", type=str, default="lerobot")
     parser.add_argument("--data_paths", type=str, required=False)
     parser.add_argument("--dataset_config_path", type=str, required=True)
     parser.add_argument("--image_size", type=int, default=448)
     parser.add_argument("--binarize_gripper", action="store_true", default=False)
     parser.add_argument("--use_augmentation", action="store_true")
+    parser.add_argument(
+        "--augmentation_mode",
+        type=str,
+        default="legacy_mix",
+        choices=["legacy_mix", "always", "off"],
+        help="Image augmentation policy when --use_augmentation is enabled.",
+    )
+    parser.add_argument(
+        "--augmentation_prob",
+        type=float,
+        default=0.5,
+        help="Probability of applying augmentation for legacy_mix mode.",
+    )
+    parser.add_argument("--use_cached_dataset", dest="use_cached_dataset", action="store_true")
+    parser.add_argument("--no_use_cached_dataset", dest="use_cached_dataset", action="store_false")
+    parser.set_defaults(use_cached_dataset=True)
     parser.add_argument("--cache_dir", type=str, default=None)
+    parser.add_argument("--cache_format", type=str, default="indexed_v2", choices=["indexed_v2", "legacy"])
+    parser.add_argument("--cache_shard_size_mb", type=int, default=512)
+    parser.add_argument("--cache_image_codec", type=str, default="png", choices=["png", "jpeg"])
     parser.add_argument("--dataset_num_workers", type=int, default=None)
     parser.add_argument(
         "--auto_export_cached_dataset",
@@ -620,6 +866,10 @@ if __name__ == "__main__":
         help="Require existing cached manifest and skip auto-export.",
     )
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--fused_adamw", dest="fused_adamw", action="store_true")
+    parser.add_argument("--no_fused_adamw", dest="fused_adamw", action="store_false")
+    parser.set_defaults(fused_adamw=False)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_steps", type=int, default=600)
     parser.add_argument("--warmup_steps", type=int, default=300)
@@ -644,17 +894,29 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--no_vlm_batched_forward", dest="vlm_batched_forward", action="store_false")
     parser.add_argument("--vlm_batched_forward", dest="vlm_batched_forward", action="store_true")
-    parser.set_defaults(vlm_batched_forward=True)
+    parser.set_defaults(vlm_batched_forward=False)
     parser.add_argument("--no_embedder_tensor_fastpath", dest="embedder_tensor_fastpath", action="store_false")
     parser.add_argument("--embedder_tensor_fastpath", dest="embedder_tensor_fastpath", action="store_true")
-    parser.set_defaults(embedder_tensor_fastpath=True)
+    parser.set_defaults(embedder_tensor_fastpath=False)
+    parser.add_argument(
+        "--gradient_checkpointing_use_reentrant",
+        dest="gradient_checkpointing_use_reentrant",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no_gradient_checkpointing_use_reentrant",
+        dest="gradient_checkpointing_use_reentrant",
+        action="store_false",
+    )
+    parser.set_defaults(gradient_checkpointing_use_reentrant=False)
     parser.add_argument("--disable_tf32", dest="allow_tf32", action="store_false")
     parser.add_argument("--allow_tf32", dest="allow_tf32", action="store_true")
-    parser.set_defaults(allow_tf32=True)
+    parser.set_defaults(allow_tf32=False)
     parser.add_argument("--disable_cudnn_benchmark", dest="cudnn_benchmark", action="store_false")
     parser.add_argument("--cudnn_benchmark", dest="cudnn_benchmark", action="store_true")
-    parser.set_defaults(cudnn_benchmark=True)
+    parser.set_defaults(cudnn_benchmark=False)
     parser.add_argument("--disable_tqdm", action="store_true")
+    parser.add_argument("--non_finite_max_streak", type=int, default=5)
 
     args = parser.parse_args()
     config = vars(args)

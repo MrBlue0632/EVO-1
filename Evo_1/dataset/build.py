@@ -6,11 +6,13 @@ from torch.utils.data import DataLoader
 
 try:
     from .cached_dataset import CachedLeRobotDataset
+    from .indexed_cached_dataset import IndexedCachedLeRobotDataset
     from .exporter import build_export_key, export_cached_dataset
     from .lerobot_dataset_pretrain_mp import LeRobotDataset
     from .utils import collate_batch
 except ImportError:
     from dataset.cached_dataset import CachedLeRobotDataset
+    from dataset.indexed_cached_dataset import IndexedCachedLeRobotDataset
     from dataset.exporter import build_export_key, export_cached_dataset
     from dataset.lerobot_dataset_pretrain_mp import LeRobotDataset
     from dataset.utils import collate_batch
@@ -43,10 +45,23 @@ def build_cached_dataset(config: dict):
             manifest_path = export_cached_dataset(config, dataset_config)
         else:
             raise FileNotFoundError(f'Cached dataset manifest not found: {manifest_path}')
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        manifest = yaml.safe_load(handle)
+    schema_version = int(manifest.get("schema_version", 0))
+    if schema_version == 2:
+        return IndexedCachedLeRobotDataset(
+            manifest_path,
+            image_size=config.get("image_size", 448),
+            use_augmentation=config.get("use_augmentation", False),
+            augmentation_mode=config.get("augmentation_mode", "legacy_mix"),
+            augmentation_prob=float(config.get("augmentation_prob", 0.5)),
+        )
     return CachedLeRobotDataset(
         manifest_path,
         image_size=config.get('image_size', 448),
         use_augmentation=config.get('use_augmentation', False),
+        augmentation_mode=config.get("augmentation_mode", "legacy_mix"),
+        augmentation_prob=float(config.get("augmentation_prob", 0.5)),
     )
 
 
@@ -68,6 +83,8 @@ def build_dataset(config: dict):
         binarize_gripper=config.get('binarize_gripper', False),
         cache_dir=config.get('cache_dir'),
         use_augmentation=config.get('use_augmentation', False),
+        augmentation_mode=config.get("augmentation_mode", "legacy_mix"),
+        augmentation_prob=float(config.get("augmentation_prob", 0.5)),
         num_cache_workers=config.get('dataset_num_workers'),
     )
 

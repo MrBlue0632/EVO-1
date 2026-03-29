@@ -223,6 +223,8 @@ class FlowmatchingActionHead(nn.Module):
                                                                num_categories=num_categories)
 
         self.single_action_proj = None
+        if horizon <= 1:
+            self.single_action_proj = nn.Linear(self.per_action_dim, self.embed_dim)
 
     def _get_time_embedding(self, t: torch.Tensor) -> torch.Tensor:
         time_index = (t * 999).long().clamp_(0, 999)
@@ -232,7 +234,7 @@ class FlowmatchingActionHead(nn.Module):
         if self.horizon > 1 and self.action_encoder is not None:
             return self.action_encoder(action_seq, embodiment_id)
         if self.single_action_proj is None:
-            self.single_action_proj = nn.Linear(self.per_action_dim, self.embed_dim).to(action_seq.device)
+            raise RuntimeError("single_action_proj is not initialized for horizon <= 1.")
         return self.single_action_proj(action_seq)
 
     def _expand_action_mask(self, action_mask: torch.Tensor, batch_size: int, per_action_dim: int, device, dtype):
@@ -314,10 +316,6 @@ class FlowmatchingActionHead(nn.Module):
         if self.horizon > 1:
  
             x_flat = x.reshape(B, -1)  
-
-            if not hasattr(self, "seq_pool_proj"):
-              
-                self.seq_pool_proj = nn.Linear(self.horizon * self.embed_dim, self.embed_dim).to(device)
             x_pooled = self.seq_pool_proj(x_flat)  
         else:
           
@@ -383,12 +381,7 @@ class FlowmatchingActionHead(nn.Module):
 
             if self.horizon > 1:
                 x_flat = x.reshape(B, -1)
-                if hasattr(self, "seq_pool_proj"):
-                    x_pooled = self.seq_pool_proj(x_flat)
-                else:
-                   
-                    self.seq_pool_proj = nn.Linear(self.horizon * self.embed_dim, self.embed_dim).to(device)
-                    x_pooled = self.seq_pool_proj(x_flat)
+                x_pooled = self.seq_pool_proj(x_flat)
             else:
                 x_pooled = x.squeeze(1)
          
@@ -400,8 +393,9 @@ class FlowmatchingActionHead(nn.Module):
                 action_seq = action.view(B, self.horizon, per_action_dim)
             else:
                 action_seq = action.view(B, 1, per_action_dim)
-      
-        return action
+
+        action_seq = action_seq * action_mask
+        return action_seq.reshape(B, -1)
 
     @property
     def device(self):

@@ -1,0 +1,11 @@
+max_action_dim: 24
+max_state_dim: 24
+max_views: 3
+
+data_groups:
+  libero_franka:
+    libero_25_10_04_lerobotv2_1:
+      path: /root/libero_25_10_04_lerobotv2.1
+      view_map:
+        image_1: observation.images.image_1
+        image_2: observation.images.image_2
