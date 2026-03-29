@@ -28,6 +28,8 @@ class EVO1(nn.Module):
         self.embedder = InternVL3Embedder(
             model_name=self.model_config.vlm_name,
             device=self._device,
+            enable_gradient_checkpointing=self.model_config.finetune_vlm,
+            enable_tensor_fastpath=self.model_config.embedder_tensor_fastpath,
         )
         self.action_head = self._build_action_head().to(self._device)
 
@@ -49,6 +51,24 @@ class EVO1(nn.Module):
             image_tensors=images,
             image_mask=image_mask,
             text_prompt=prompt,
+            return_cls_only=return_cls_only,
+        )
+
+    def get_vl_embeddings_batch(
+        self,
+        images_batch: List[List[Union[Image.Image, torch.Tensor]]],
+        image_masks: torch.Tensor,
+        prompts: List[str],
+        return_cls_only: Optional[bool] = None,
+    ) -> torch.Tensor:
+        if return_cls_only is None:
+            return_cls_only = self.return_cls_only
+        if images_batch is None or len(images_batch) == 0:
+            raise ValueError('Must provide at least one sample for batched VLM embeddings.')
+        return self.embedder.get_fused_image_text_embeddings_batched(
+            image_tensors_batch=images_batch,
+            image_masks=image_masks,
+            text_prompts=prompts,
             return_cls_only=return_cls_only,
         )
 
@@ -93,8 +113,8 @@ class EVO1(nn.Module):
         image_mask: torch.Tensor,
         prompt: str,
         state_input: Union[list, torch.Tensor],
+        action_mask: torch.Tensor,
         return_cls_only: Optional[bool] = None,
-        action_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         fused_tokens = self.get_vl_embeddings(
             images=images,

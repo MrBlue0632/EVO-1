@@ -22,6 +22,7 @@ class Evo1ModelConfig:
     num_categories: int = 1
     finetune_vlm: bool = False
     finetune_action_head: bool = False
+    embedder_tensor_fastpath: bool = True
 
     @classmethod
     def from_mapping(cls, raw_config: Mapping[str, Any]) -> 'Evo1ModelConfig':
@@ -57,6 +58,7 @@ class Evo1ModelConfig:
             num_categories=int(config.get('num_categories', cls.num_categories)),
             finetune_vlm=bool(config.get('finetune_vlm', cls.finetune_vlm)),
             finetune_action_head=bool(config.get('finetune_action_head', cls.finetune_action_head)),
+            embedder_tensor_fastpath=bool(config.get('embedder_tensor_fastpath', cls.embedder_tensor_fastpath)),
         )
 
     def to_dict(self) -> Dict[str, Any]:

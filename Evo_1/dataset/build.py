@@ -75,13 +75,20 @@ def build_dataset(config: dict):
 def build_dataloader(dataset, config: dict) -> DataLoader:
     batch_size = int(config.get('batch_size', 8))
     num_workers = int(config.get('num_workers', 8))
+    pin_memory = bool(config.get('pin_memory', True))
+    persistent_workers = bool(config.get('persistent_workers', num_workers > 0))
+    prefetch_factor = config.get('prefetch_factor', 4)
+    loader_kwargs = {}
+    if num_workers > 0 and prefetch_factor is not None:
+        loader_kwargs['prefetch_factor'] = int(prefetch_factor)
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=num_workers > 0,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers and num_workers > 0,
         drop_last=True,
         collate_fn=collate_batch,
+        **loader_kwargs,
     )

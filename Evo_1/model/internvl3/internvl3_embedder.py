@@ -2,16 +2,25 @@
 import torch
 from PIL import Image
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer
 from torchvision.transforms.functional import to_pil_image
-from typing import Union, List
+from typing import List, Sequence, Union
 import logging
 
 logger = logging.getLogger(__name__)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def flash_attn_is_available() -> bool:
+    try:
+        import flash_attn  # noqa: F401
+    except ModuleNotFoundError:
+        return False
+    return True
 
 # === Image Transformations ===
 def build_transform(input_size):
@@ -67,19 +76,33 @@ def dynamic_preprocess(image, min_num=1, max_num=1, image_size=448, use_thumbnai
     return processed_images
 
 class InternVL3Embedder(nn.Module):
-    def __init__(self, model_name="OpenGVLab/InternVL3-1B", image_size=448, device="cuda"):
+    def __init__(
+        self,
+        model_name="OpenGVLab/InternVL3-1B",
+        image_size=448,
+        device="cuda",
+        enable_gradient_checkpointing: bool = False,
+        enable_tensor_fastpath: bool = True,
+    ):
         super().__init__()
         self.device = device
         self.image_size = image_size
         self.max_text_length = 1024  # InternVL3 supports up to 1024 tokens
+        self.enable_gradient_checkpointing = bool(enable_gradient_checkpointing)
+        self.enable_tensor_fastpath = bool(enable_tensor_fastpath)
         self.transform = build_transform(image_size)
+        self._mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1)
+        self._std = torch.tensor(IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+        use_flash_attn = flash_attn_is_available()
+        if not use_flash_attn:
+            logger.warning("flash_attn is not installed. Falling back to standard attention.")
         self.model = AutoModel.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            use_flash_attn=True,
+            use_flash_attn=use_flash_attn,
             low_cpu_mem_usage=True,
             _fast_init=False,
         ).to(self.device) 
@@ -96,25 +119,91 @@ class InternVL3Embedder(nn.Module):
         else:
             self.model.language_model.layers = torch.nn.ModuleList(layers)
         self.model.language_model.lm_head = torch.nn.Identity()
+        self._configure_memory_features()
+
+    def _configure_memory_features(self) -> None:
+        if not self.enable_gradient_checkpointing:
+            if hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "encoder"):
+                self.model.vision_model.encoder.gradient_checkpointing = False
+            return
+
+        enabled_any = False
+
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable()
+            enabled_any = True
 
         if hasattr(self.model, "vision_model") and hasattr(self.model.vision_model, "encoder"):
-            self.model.vision_model.encoder.gradient_checkpointing = False
-        
+            self.model.vision_model.encoder.gradient_checkpointing = True
+            enabled_any = True
+
+        if hasattr(self.model, "language_model"):
+            language_model = self.model.language_model
+            if hasattr(language_model, "gradient_checkpointing_enable"):
+                language_model.gradient_checkpointing_enable()
+                enabled_any = True
+            if hasattr(language_model, "model") and hasattr(language_model.model, "gradient_checkpointing_enable"):
+                language_model.model.gradient_checkpointing_enable()
+                enabled_any = True
+            if hasattr(language_model, "config"):
+                language_model.config.use_cache = False
+
+        if hasattr(self.model, "config"):
+            self.model.config.use_cache = False
+
+        if hasattr(self.model, "enable_input_require_grads"):
+            self.model.enable_input_require_grads()
+
+        if enabled_any:
+            logger.info("Gradient checkpointing enabled for InternVL3 embedder.")
+        else:
+            logger.warning("Requested gradient checkpointing, but model does not expose checkpointing controls.")
+
+    def _tensor_to_normalized_tile(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        if image_tensor.dim() != 3 or image_tensor.shape[0] != 3:
+            raise ValueError(f"Expected image tensor shape (3,H,W), got {tuple(image_tensor.shape)}")
+
+        tensor = image_tensor.detach().to(dtype=torch.float32, device="cpu")
+        if tensor.shape[-2:] != (self.image_size, self.image_size):
+            tensor = F.interpolate(
+                tensor.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze(0)
+
+        tensor_min = float(tensor.min().item())
+        tensor_max = float(tensor.max().item())
+        if tensor_max > 1.5 or tensor_min < -0.5:
+            tensor = tensor / 255.0
+
+        mean = self._mean.to(dtype=tensor.dtype)
+        std = self._std.to(dtype=tensor.dtype)
+        return (tensor - mean) / std
 
     def _preprocess_images(
         self,
-        image_tensors: List[Union[Image.Image, torch.Tensor]]
+        image_tensors: Sequence[Union[Image.Image, torch.Tensor]],
+        move_to_device: bool = True,
     ) -> (torch.Tensor, List[int]):
 
         pixel_values_list = []
-        for i, image in enumerate(image_tensors):
-            if isinstance(image, torch.Tensor):
-                image = to_pil_image(image)
-            tiles = dynamic_preprocess(image, image_size=self.image_size)
-            tile_tensors = torch.stack([self.transform(t) for t in tiles])  # (T_i, 3, 448, 448)
+        for image in image_tensors:
+            if isinstance(image, torch.Tensor) and self.enable_tensor_fastpath:
+                tile_tensors = self._tensor_to_normalized_tile(image).unsqueeze(0)
+            else:
+                if isinstance(image, torch.Tensor):
+                    image = to_pil_image(image)
+                tiles = dynamic_preprocess(image, image_size=self.image_size)
+                tile_tensors = torch.stack([self.transform(t) for t in tiles])  # (T_i, 3, 448, 448)
             pixel_values_list.append(tile_tensors)
 
-        pixel_values = torch.cat(pixel_values_list, dim=0).to(dtype=torch.bfloat16, device=self.device)
+        if not pixel_values_list:
+            raise ValueError("No images provided for preprocessing.")
+
+        pixel_values = torch.cat(pixel_values_list, dim=0)
+        if move_to_device:
+            pixel_values = pixel_values.to(dtype=torch.bfloat16, device=self.device)
         num_tiles_list = [pv.shape[0] for pv in pixel_values_list]
 
         return pixel_values, num_tiles_list
@@ -178,19 +267,14 @@ class InternVL3Embedder(nn.Module):
 
         selected = (input_ids == self.img_context_token_id)
 
-            
-        try:
-            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
-        except Exception as e:
-            vit_embeds = vit_embeds.reshape(-1, C)
-            logger.warning(
-                "Image embedding/token mismatch: %s, selected_shape=%s vit_shape=%s",
-                e,
-                tuple(input_embeds[selected].shape),
-                tuple(vit_embeds.shape),
+        vit_embeds = vit_embeds.reshape(-1, C)
+        n_selected = int(selected.sum().item())
+        if n_selected != vit_embeds.shape[0]:
+            raise RuntimeError(
+                "Image embedding/token mismatch: selected_tokens=%s vit_tokens=%s selected_shape=%s vit_shape=%s"
+                % (n_selected, vit_embeds.shape[0], tuple(input_embeds[selected].shape), tuple(vit_embeds.shape))
             )
-            n_token = selected.sum()
-            input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds[:n_token]
+        input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds
 
  
         tokens_per_tile = self.model.num_image_token 
@@ -216,6 +300,18 @@ class InternVL3Embedder(nn.Module):
         input_embeds = input_embeds.reshape(B, N, C)
         return input_embeds, attention_mask
 
+    def _extract_hidden_from_language_output(self, outputs):
+        if isinstance(outputs, tuple):
+            if len(outputs) > 0 and isinstance(outputs[0], torch.Tensor) and outputs[0].dim() == 3:
+                return outputs[0]
+            if len(outputs) > 2 and isinstance(outputs[2], (tuple, list)) and len(outputs[2]) > 0:
+                return outputs[2][-1]
+            raise RuntimeError("language_model tuple output does not contain usable hidden states.")
+        if hasattr(outputs, "hidden_states") and outputs.hidden_states:
+            return outputs.hidden_states[-1]
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            return outputs.last_hidden_state
+        raise RuntimeError("language_model output does not contain hidden states.")
 
     def get_fused_image_text_embedding_from_tensor_images(
         self,
@@ -241,8 +337,76 @@ class InternVL3Embedder(nn.Module):
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             output_hidden_states=True,
+            use_cache=False,
             return_dict=True,
         )
-        fused_hidden = outputs.hidden_states[-1].to(torch.float32)
 
+        fused_hidden = self._extract_hidden_from_language_output(outputs)
+
+        return fused_hidden[:, 0, :] if return_cls_only else fused_hidden
+
+    def get_fused_image_text_embeddings_batched(
+        self,
+        image_tensors_batch: Sequence[Sequence[Union[Image.Image, torch.Tensor]]],
+        image_masks: torch.Tensor,
+        text_prompts: Sequence[str],
+        return_cls_only: bool = True,
+    ) -> torch.Tensor:
+        batch_size = len(image_tensors_batch)
+        if batch_size == 0:
+            raise ValueError("image_tensors_batch must not be empty.")
+        if len(text_prompts) != batch_size:
+            raise ValueError(f"text_prompts length {len(text_prompts)} does not match batch_size {batch_size}")
+        if image_masks.shape[0] != batch_size:
+            raise ValueError(f"image_masks first dim {image_masks.shape[0]} does not match batch_size {batch_size}")
+
+        sample_pixels = []
+        sample_num_tiles = []
+        token_counts = []
+        for image_tensors in image_tensors_batch:
+            pixel_values, num_tiles_list = self._preprocess_images(image_tensors, move_to_device=False)
+            sample_pixels.append(pixel_values)
+            sample_num_tiles.append(num_tiles_list)
+            token_counts.append(sum(num_tiles_list) * int(self.model.num_image_token))
+
+        flat_pixels = torch.cat(sample_pixels, dim=0).to(dtype=torch.bfloat16, device=self.device)
+        vit_embeds_all = self.model.extract_feature(flat_pixels)
+        if vit_embeds_all.dim() == 3:
+            vit_embeds_all = vit_embeds_all.reshape(-1, vit_embeds_all.shape[-1])
+
+        total_expected_tokens = sum(token_counts)
+        if vit_embeds_all.shape[0] != total_expected_tokens:
+            raise RuntimeError(
+                f"Batched VIT embedding mismatch: expected {total_expected_tokens}, got {vit_embeds_all.shape[0]}"
+            )
+
+        batched_inputs = []
+        batched_attention_masks = []
+        offset = 0
+        for idx in range(batch_size):
+            token_count = token_counts[idx]
+            sample_vit = vit_embeds_all[offset:offset + token_count]
+            offset += token_count
+
+            prompt = self._build_multimodal_prompt(sample_num_tiles[idx], text_prompts[idx])
+            inputs_embeds, attention_mask = self._prepare_and_fuse_embeddings(
+                prompt=prompt,
+                vit_embeds=sample_vit,
+                image_mask=image_masks[idx],
+                num_tiles_list=sample_num_tiles[idx],
+            )
+            batched_inputs.append(inputs_embeds)
+            batched_attention_masks.append(attention_mask)
+
+        inputs_embeds = torch.cat(batched_inputs, dim=0)
+        attention_mask = torch.cat(batched_attention_masks, dim=0)
+
+        outputs = self.model.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        fused_hidden = self._extract_hidden_from_language_output(outputs)
         return fused_hidden[:, 0, :] if return_cls_only else fused_hidden
